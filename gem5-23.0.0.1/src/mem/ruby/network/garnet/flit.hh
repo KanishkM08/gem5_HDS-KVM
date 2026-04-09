@@ -38,6 +38,8 @@
 #include "mem/ruby/network/garnet/CommonTypes.hh"
 #include "mem/ruby/slicc_interface/Message.hh"
 
+#include "mem/ruby/network/garnet/OutOfOrder.hh"
+
 namespace gem5
 {
 
@@ -115,6 +117,15 @@ class flit
 
     uint32_t m_width;
     int msgSize;
+
+    std::bitset<HEAD_FLIT_SIZE> flit_bin; //Binary representation of flit
+
+    void set_seq_num (int seq);
+    uint32_t get_seq_num ();
+
+    void set_payload(std::bitset<HEAD_FLIT_SIZE> data);
+    std::bitset<HEAD_FLIT_SIZE> get_payload ();
+
   protected:
     int m_packet_id;
     int m_id;

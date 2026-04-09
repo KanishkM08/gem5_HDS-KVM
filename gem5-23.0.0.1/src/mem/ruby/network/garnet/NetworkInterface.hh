@@ -91,6 +91,15 @@ class NetworkInterface : public ClockedObject, public Consumer
         return oPort->routerID();
     }
 
+    // VC -> Sequence-indexed Buffer
+    std::vector<std::vector<flit *>> m_ni_rob;
+    std::vector<uint32_t> m_ni_expected_seq;
+
+    // For total switching probability
+    static double globalTotalProbBefore;
+    static double globalTotalProbAfter;
+    static uint64_t globalTotalPackets;
+
     class OutputPort
     {
       public:

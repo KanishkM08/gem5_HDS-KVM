@@ -31,6 +31,7 @@
 
 
 #include "mem/ruby/network/garnet/NetworkInterface.hh"
+#include "mem/ruby/network/garnet/OutOfOrder.hh"
 
 #include <cassert>
 #include <cmath>
@@ -41,6 +42,7 @@
 #include "mem/ruby/network/garnet/Credit.hh"
 #include "mem/ruby/network/garnet/flitBuffer.hh"
 #include "mem/ruby/slicc_interface/Message.hh"
+#include "mem/ruby/system/RubySystem.hh"
 
 namespace gem5
 {
@@ -51,6 +53,10 @@ namespace ruby
 namespace garnet
 {
 
+double NetworkInterface::globalTotalProbBefore = 0.0;
+double NetworkInterface::globalTotalProbAfter = 0.0;
+uint64_t NetworkInterface::globalTotalPackets = 0;
+
 NetworkInterface::NetworkInterface(const Params &p)
   : ClockedObject(p), Consumer(this), m_id(p.id),
     m_virtual_networks(p.virt_nets), m_vc_per_vnet(0),
@@ -59,7 +65,11 @@ NetworkInterface::NetworkInterface(const Params &p)
     vc_busy_counter(m_virtual_networks, 0)
 {
     m_stall_count.resize(m_virtual_networks);
-    niOutVcs.resize(0);
+    niOutVcs.resize(0);  
+
+    int total_vcs = p.vcs_per_vnet * p.virt_nets;
+    m_ni_expected_seq.assign(total_vcs, 0);
+    m_ni_rob.resize(total_vcs);
 }
 
 void
@@ -224,6 +234,101 @@ NetworkInterface::wakeup()
     checkStallQueue();
 
     /*********** Check the incoming flit link **********/
+    /*
+    DPRINTF(RubyNetwork, "Number of input ports: %d\n", inPorts.size());
+    for (auto &iPort: inPorts) {
+        NetworkLink *inNetLink = iPort->inNetLink();
+        if (inNetLink->isReady(curTick())) {
+            flit *t_flit = inNetLink->consumeLink();
+
+            int vc = t_flit->get_vc();
+            uint32_t seq = t_flit->get_seq_num();
+
+            //Ensuring the vector is large enough for this seq num
+            if (seq >= m_ni_rob[vc].size()) {
+                // Resize to seq + 1, initializing new slots to nullptr
+                m_ni_rob[vc].resize(seq + 1, nullptr);
+            }
+            
+            m_ni_rob[vc][seq] = t_flit; //Storing flit in the ROB
+
+            //DPRINTF(RubyNetwork, "Recieved flit:%s\n", *t_flit);
+            DPRINTF(RubyNetwork, "NI received flit %d on VC %d. Buffering in ROB...\n", seq, vc);
+            assert(t_flit->m_width == iPort->bitWidth());
+
+            while (m_ni_expected_seq[vc] < m_ni_rob[vc].size() && 
+                   m_ni_rob[vc][m_ni_expected_seq[vc]] != nullptr) {
+
+                uint32_t cur_seq = m_ni_expected_seq[vc];
+                flit *ordered_flit = m_ni_rob[vc][cur_seq];
+
+                int vnet = t_flit->get_vnet();
+                ordered_flit->set_dequeue_time(curTick());
+
+                // If a tail flit is received, enqueue into the protocol buffers
+                // if space is available. Otherwise, exchange non-tail flits for
+                // credits.
+                if (ordered_flit->get_type() == TAIL_ ||
+                    ordered_flit->get_type() == HEAD_TAIL_) {
+                    if (!iPort->messageEnqueuedThisCycle &&
+                        outNode_ptr[vnet]->areNSlotsAvailable(1, curTime)) {
+                        // Space is available. Enqueue to protocol buffer.
+                        outNode_ptr[vnet]->enqueue(ordered_flit->get_msg_ptr(), curTime,
+                                                   cyclesToTicks(Cycles(1)));
+                        // Simply send a credit back since we are not buffering
+                        // this flit in the NI
+                        Credit *cFlit = new Credit(ordered_flit->get_vc(),
+                                                   true, curTick());
+                        iPort->sendCredit(cFlit);
+                        // Update stats and delete flit pointer
+                        incrementStats(ordered_flit);
+
+                        // Reseting the sequence for this VC
+                        m_ni_rob[vc][cur_seq] = nullptr;
+                        m_ni_expected_seq[vc] = 0;
+                        m_ni_rob[vc].clear(); //Shrinking the vector back to save memory for next packet
+                        
+                        delete ordered_flit;
+                    } else {
+                        // No space available- Place tail flit in stall queue and
+                        // set up a callback for when protocol buffer is dequeued.
+                        // Stat update and flit pointer deletion will occur upon
+                        // unstall.
+                        iPort->m_stall_queue.push_back(ordered_flit);
+                        m_stall_count[vnet]++;
+                    
+                        outNode_ptr[vnet]->registerDequeueCallback([this]() {
+                            dequeueCallback(); });
+
+                        m_ni_rob[vc][m_ni_expected_seq[vc]] = nullptr;
+                        m_ni_expected_seq[vc] = 0;
+                        m_ni_rob[vc].clear();
+
+                        break;
+                    }
+                } else {
+                    // Non-tail flit. Send back a credit but not VC free signal.
+                    Credit *cFlit = new Credit(ordered_flit->get_vc(), false,
+                                                   curTick());
+                    // Simply send a credit back since we are not buffering
+                    // this flit in the NI
+                    iPort->sendCredit(cFlit);
+                
+                    // Update stats and delete flit pointer.
+                    incrementStats(ordered_flit);
+
+                    DPRINTF(RubyNetwork, "ROB releasing flit %d to network. Expected next: %d\n", 
+                    ordered_flit->get_seq_num(), m_ni_expected_seq[vc] + 1);
+
+                    m_ni_rob[vc][cur_seq] = nullptr; //Clearing the ROB slot
+                    m_ni_expected_seq[vc]++; // Updating the required next seq num
+
+                    delete ordered_flit;
+                }
+            }
+        }
+    }
+    */
     DPRINTF(RubyNetwork, "Number of input ports: %d\n", inPorts.size());
     for (auto &iPort: inPorts) {
         NetworkLink *inNetLink = iPort->inNetLink();
@@ -404,7 +509,7 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
                 if ((destID >= MachineType_base_number((MachineType) m)) &&
                     destID < MachineType_base_number((MachineType) (m+1))) {
                     // calculating the NetDest associated with this destID
-                    personal_dest.clear();
+                     personal_dest.clear();
                     personal_dest.add((MachineID) {(MachineType) m, (destID -
                         MachineType_base_number((MachineType) m))});
                     new_net_msg_ptr->getDestination() = personal_dest;
@@ -437,6 +542,9 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
         m_net_ptr->increment_injected_packets(vnet);
         m_net_ptr->update_traffic_distribution(route);
         int packet_id = m_net_ptr->getNextPacketID();
+
+        std::vector<flit*> unsorted_f; 
+
         for (int i = 0; i < num_flits; i++) {
             m_net_ptr->increment_injected_flits(vnet);
             flit *fl = new flit(packet_id,
@@ -445,8 +553,43 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
                 net_msg_ptr->getMessageSize()),
                 oPort->bitWidth(), curTick());
 
+            fl->flit_bin = OOO::BinarizeFlit(fl);
+            fl->set_seq_num(i);
+
             fl->set_src_delay(curTick() - msg_ptr->getTime());
-            niOutVcs[vc].insert(fl);
+
+            unsorted_f.push_back(fl);
+            //niOutVcs[vc].insert(fl);
+        }
+
+        OOO::populateFlitData(unsorted_f, msg_ptr);
+
+        globalTotalPackets++;
+
+        globalTotalProbBefore += OOO::calculateSwitchingProb(unsorted_f);
+
+        //Printing unsorted flits for debugging
+        DPRINTF(RubyNetwork, "Unsorted flits Begin\n");
+        for (auto it:unsorted_f){
+            DPRINTF(RubyNetwork, "|Flit %d (Type %d) | Seq Num %d | Data: %x |\n", it->get_id(), it->get_type(), it->get_seq_num(), it->flit_bin);
+        }
+        DPRINTF(RubyNetwork, "Unsorted flits End\n");
+
+        std::vector<flit*> sorted_f = OOO::HammingDistanceSort(unsorted_f);
+
+        globalTotalProbAfter += OOO::calculateSwitchingProb(sorted_f);
+
+        //Printing sorted flits for debugging
+        DPRINTF(RubyNetwork, "Sorted flits Begin\n");
+        for (auto it:sorted_f){
+            DPRINTF(RubyNetwork, "|Flit %d (Type %d) | Seq Num %d | Data: %x |\n", it->get_id(), it->get_type(), it->get_seq_num(), it->flit_bin);
+        }
+        DPRINTF(RubyNetwork, "Sorted flits End\n");
+
+        DPRINTF(RubyNetwork, "Running Global Stats: Switching Prob Before: %f, After: %f\n", (globalTotalProbBefore / globalTotalPackets)*100, (globalTotalProbAfter / globalTotalPackets)*100);
+
+        for (int i = 0; i < num_flits; i++){
+            niOutVcs[vc].insert(sorted_f[i]);
         }
 
         m_ni_out_vcs_enqueue_time[vc] = curTick();

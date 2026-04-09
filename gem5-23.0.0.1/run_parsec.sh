@@ -22,8 +22,8 @@ export LD_LIBRARY_PATH=$HOOKS_LIB:$LD_LIBRARY_PATH
 #tar -xvf $INPUT_DIR/input_simdev.tar -C $INPUT_DIR
 #tar -xvf $INPUT_DIR/input_simlarge.tar -C $INPUT_DIR
 #tar -xvf $INPUT_DIR/input_simmedium.tar -C $INPUT_DIR
-#tar -xvf $INPUT_DIR/input_simsmall.tar -C $INPUT_DIR        # in_4K.txt is in this tarball
-tar -xvf $INPUT_DIR/input_test.tar -C $INPUT_DIR           # in_4.txt is in this tarball
+tar -xvf $INPUT_DIR/input_simsmall.tar -C $INPUT_DIR        # in_4K.txt is in this tarball
+#tar -xvf $INPUT_DIR/input_test.tar -C $INPUT_DIR           # in_4.txt is in this tarball
 
 echo "Starting ROI"
 /sbin/m5 exit 1
